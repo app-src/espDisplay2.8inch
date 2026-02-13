@@ -42,3 +42,4 @@ void LCD_DrawString(uint16_t x, uint16_t y, const char *str, uint16_t color, uin
 
 void Backlight_Init(void);
 void Set_Backlight(uint8_t Light);
+void LCD_WriteData_Word(uint16_t Data);
