@@ -8,12 +8,14 @@
 // ==========================================
 // PARTICLE SIMULATION CONFIG
 // ==========================================
-#define NUM_PARTICLES    450
-#define PARTICLE_RADIUS  3
-#define GRAVITY_SCALE    0.8f
-#define DAMPING          0.95f
-#define BOUNCE_LOSS      0.6f
-#define MAX_VELOCITY     8.0f
+#define NUM_PARTICLES    550
+#define PARTICLE_RADIUS  4
+#define GRAVITY_SCALE    0.59f
+#define DAMPING          0.99f
+#define BOUNCE_LOSS      0.1f
+#define MAX_VELOCITY     12.0f
+#define JERK_SCALE       20.0f    // Impulse multiplier for sudden movements
+#define JERK_THRESHOLD   0.3f   // Minimum accel change to count as a jerk
 
 // Colors (RGB565)
 #define COLOR_BG         0x0011   // Very dark blue
@@ -123,7 +125,7 @@ void initParticles() {
   }
 }
 
-void updateParticles(float gx, float gy) {
+void updateParticles(float gx, float gy, float jerkX, float jerkY) {
   float minX = PARTICLE_RADIUS;
   float maxX = LCD_WIDTH - 1 - PARTICLE_RADIUS;
   float minY = PARTICLE_RADIUS;
@@ -135,6 +137,10 @@ void updateParticles(float gx, float gy) {
     // Apply gravity from IMU
     p.vx += gx * GRAVITY_SCALE;
     p.vy += gy * GRAVITY_SCALE;
+
+    // Apply jerk impulse (sudden movements)
+    p.vx += jerkX * JERK_SCALE;
+    p.vy += jerkY * JERK_SCALE;
 
     // Apply damping
     p.vx *= DAMPING;
@@ -150,92 +156,114 @@ void updateParticles(float gx, float gy) {
     p.x += p.vx;
     p.y += p.vy;
 
-    // Bounce off walls
-    if (p.x < minX) { p.x = minX; p.vx = -p.vx * BOUNCE_LOSS; }
-    if (p.x > maxX) { p.x = maxX; p.vx = -p.vx * BOUNCE_LOSS; }
-    if (p.y < minY) { p.y = minY; p.vy = -p.vy * BOUNCE_LOSS; }
-    if (p.y > maxY) { p.y = maxY; p.vy = -p.vy * BOUNCE_LOSS; }
+    // Bounce off walls (high restitution - keep most energy)
+    if (p.x < minX) { p.x = minX; p.vx = fabsf(p.vx) * 0.9f; }
+    if (p.x > maxX) { p.x = maxX; p.vx = -fabsf(p.vx) * 0.9f; }
+    if (p.y < minY) { p.y = minY; p.vy = fabsf(p.vy) * 0.9f; }
+    if (p.y > maxY) { p.y = maxY; p.vy = -fabsf(p.vy) * 0.9f; }
   }
 
   // Grid-based particle-particle collision
-  // Grid cell size = particle diameter, only check neighbors
+  // Multiple iterations to resolve overlaps fully
   #define GRID_CELL (PARTICLE_RADIUS * 2)
   #define GRID_W (LCD_WIDTH / GRID_CELL + 1)
   #define GRID_H (LCD_HEIGHT / GRID_CELL + 1)
-  #define MAX_PER_CELL 8
+  #define MAX_PER_CELL 16
+  #define COLLISION_ITERS 4
+  #define RESTITUTION 0.9f    // 1.0 = perfectly elastic, 0.0 = perfectly inelastic
   
   static int16_t grid[GRID_W * GRID_H][MAX_PER_CELL];
   static uint8_t gridCount[GRID_W * GRID_H];
   
-  // Clear grid
-  memset(gridCount, 0, sizeof(gridCount));
-  
-  // Insert particles into grid
-  for (int i = 0; i < NUM_PARTICLES; i++) {
-    int gx_cell = (int)(particles[i].x) / GRID_CELL;
-    int gy_cell = (int)(particles[i].y) / GRID_CELL;
-    if (gx_cell < 0) gx_cell = 0;
-    if (gx_cell >= GRID_W) gx_cell = GRID_W - 1;
-    if (gy_cell < 0) gy_cell = 0;
-    if (gy_cell >= GRID_H) gy_cell = GRID_H - 1;
-    int idx = gy_cell * GRID_W + gx_cell;
-    if (gridCount[idx] < MAX_PER_CELL) {
-      grid[idx][gridCount[idx]++] = i;
+  for (int iter = 0; iter < COLLISION_ITERS; iter++) {
+    // Rebuild grid each iteration (positions change after separation)
+    memset(gridCount, 0, sizeof(gridCount));
+    
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+      int gx_cell = (int)(particles[i].x) / GRID_CELL;
+      int gy_cell = (int)(particles[i].y) / GRID_CELL;
+      if (gx_cell < 0) gx_cell = 0;
+      if (gx_cell >= GRID_W) gx_cell = GRID_W - 1;
+      if (gy_cell < 0) gy_cell = 0;
+      if (gy_cell >= GRID_H) gy_cell = GRID_H - 1;
+      int idx = gy_cell * GRID_W + gx_cell;
+      if (gridCount[idx] < MAX_PER_CELL) {
+        grid[idx][gridCount[idx]++] = i;
+      }
     }
-  }
-  
-  // Check collisions in neighboring cells
-  float minDist = PARTICLE_RADIUS * 2.0f;
-  float minDist2 = minDist * minDist;
-  
-  for (int cy = 0; cy < GRID_H; cy++) {
-    for (int cx = 0; cx < GRID_W; cx++) {
-      int cellIdx = cy * GRID_W + cx;
-      if (gridCount[cellIdx] == 0) continue;
-      
-      // Check this cell + right, bottom, bottom-right, bottom-left neighbors
-      for (int ny = cy; ny <= cy + 1 && ny < GRID_H; ny++) {
-        for (int nx = (ny == cy ? cx : cx - 1); nx <= cx + 1 && nx < GRID_W; nx++) {
-          if (nx < 0) continue;
-          int neighborIdx = ny * GRID_W + nx;
-          if (gridCount[neighborIdx] == 0) continue;
-          
-          int iStart = (cellIdx == neighborIdx) ? 0 : 0;
-          for (int ii = 0; ii < gridCount[cellIdx]; ii++) {
-            int jStart = (cellIdx == neighborIdx) ? ii + 1 : 0;
-            for (int jj = jStart; jj < gridCount[neighborIdx]; jj++) {
-              int pi = grid[cellIdx][ii];
-              int pj = grid[neighborIdx][jj];
-              
-              float dx = particles[pj].x - particles[pi].x;
-              float dy = particles[pj].y - particles[pi].y;
-              float dist2 = dx * dx + dy * dy;
-              
-              if (dist2 < minDist2 && dist2 > 0.01f) {
-                float dist = sqrtf(dist2);
-                float overlap = (minDist - dist) * 0.5f;
-                float fnx = dx / dist;
-                float fny = dy / dist;
+    
+    float minDist = PARTICLE_RADIUS * 2.0f;
+    float minDist2 = minDist * minDist;
+    
+    for (int cy = 0; cy < GRID_H; cy++) {
+      for (int cx = 0; cx < GRID_W; cx++) {
+        int cellIdx = cy * GRID_W + cx;
+        if (gridCount[cellIdx] == 0) continue;
+        
+        for (int ny = cy; ny <= cy + 1 && ny < GRID_H; ny++) {
+          for (int nx = (ny == cy ? cx : cx - 1); nx <= cx + 1 && nx < GRID_W; nx++) {
+            if (nx < 0) continue;
+            int neighborIdx = ny * GRID_W + nx;
+            if (gridCount[neighborIdx] == 0) continue;
+            
+            for (int ii = 0; ii < gridCount[cellIdx]; ii++) {
+              int jStart = (cellIdx == neighborIdx) ? ii + 1 : 0;
+              for (int jj = jStart; jj < gridCount[neighborIdx]; jj++) {
+                int pi = grid[cellIdx][ii];
+                int pj = grid[neighborIdx][jj];
                 
-                particles[pi].x -= fnx * overlap;
-                particles[pi].y -= fny * overlap;
-                particles[pj].x += fnx * overlap;
-                particles[pj].y += fny * overlap;
+                float dx = particles[pj].x - particles[pi].x;
+                float dy = particles[pj].y - particles[pi].y;
+                float dist2 = dx * dx + dy * dy;
                 
-                float dvx = particles[pj].vx - particles[pi].vx;
-                float dvy = particles[pj].vy - particles[pi].vy;
-                float dot = dvx * fnx + dvy * fny;
-                if (dot > 0) {
-                  particles[pi].vx += dot * fnx * 0.3f;
-                  particles[pi].vy += dot * fny * 0.3f;
-                  particles[pj].vx -= dot * fnx * 0.3f;
-                  particles[pj].vy -= dot * fny * 0.3f;
+                if (dist2 < minDist2 && dist2 > 0.001f) {
+                  float dist = sqrtf(dist2);
+                  float overlap = minDist - dist;
+                  float fnx = dx / dist;
+                  float fny = dy / dist;
+                  
+                  // Push apart by half overlap each + tiny extra to prevent sticking
+                  float push = overlap * 0.52f;
+                  particles[pi].x -= fnx * push;
+                  particles[pi].y -= fny * push;
+                  particles[pj].x += fnx * push;
+                  particles[pj].y += fny * push;
+                  
+                  // Nearly elastic velocity exchange (every iteration)
+                  float dvx = particles[pj].vx - particles[pi].vx;
+                  float dvy = particles[pj].vy - particles[pi].vy;
+                  float dot = dvx * fnx + dvy * fny;
+                  
+                  // dot < 0 means particles are APPROACHING (resolve collision)
+                  // dot > 0 means particles are SEPARATING (leave alone)
+                  if (dot < 0) {
+                    float impulse = dot * (1.0f + RESTITUTION) * 0.5f;
+                    particles[pi].vx += impulse * fnx;
+                    particles[pi].vy += impulse * fny;
+                    particles[pj].vx -= impulse * fnx;
+                    particles[pj].vy -= impulse * fny;
+                  } else if (overlap > minDist * 0.3f) {
+                    // Overlapping but not approaching — nudge apart
+                    float repulse = 0.3f;
+                    particles[pi].vx -= fnx * repulse;
+                    particles[pi].vy -= fny * repulse;
+                    particles[pj].vx += fnx * repulse;
+                    particles[pj].vy += fny * repulse;
+                  }
                 }
               }
             }
           }
         }
       }
+    }
+    
+    // Re-clamp to walls after separation pushes
+    for (int i = 0; i < NUM_PARTICLES; i++) {
+      if (particles[i].x < minX) particles[i].x = minX;
+      if (particles[i].x > maxX) particles[i].x = maxX;
+      if (particles[i].y < minY) particles[i].y = minY;
+      if (particles[i].y > maxY) particles[i].y = maxY;
     }
   }
 }
@@ -301,6 +329,10 @@ void setup() {
   Serial.println("Starting simulation...");
 }
 
+// Previous acceleration for jerk detection
+static float prevGx = 0, prevGy = 0;
+static bool firstFrame = true;
+
 void loop() {
   unsigned long tStart = millis();
   
@@ -311,8 +343,23 @@ void loop() {
   float gx = Accel.y;
   float gy = -Accel.x;
   
+  // Compute jerk (sudden acceleration change)
+  float jerkX = 0, jerkY = 0;
+  if (!firstFrame) {
+    float dGx = gx - prevGx;
+    float dGy = gy - prevGy;
+    float jerkMag = sqrtf(dGx * dGx + dGy * dGy);
+    if (jerkMag > JERK_THRESHOLD) {
+      jerkX = dGx;
+      jerkY = dGy;
+    }
+  }
+  firstFrame = false;
+  prevGx = gx;
+  prevGy = gy;
+  
   // Update physics
-  updateParticles(gx, gy);
+  updateParticles(gx, gy, jerkX, jerkY);
   
   // Render
   renderFrame();
